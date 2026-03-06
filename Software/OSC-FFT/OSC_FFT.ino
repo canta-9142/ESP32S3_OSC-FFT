@@ -1,18 +1,26 @@
 #include <Arduino.h>
 
-// Pin Definitions
-#define SIG_PIN  8
-#define MCP3425_SCL  7
+
+// Pin and I2C address definitions
+#define SIG_PIN      8    // Sampling Signal(回路図参照)
+#define MCP3425_SCL  7    // MCP3425
 #define MCP3425_SDA  9
 #define MCP3425_ADDR 0x68
-#define MODE_SW 11
-#define ALT_SW   1
+#define MODE_SW      11   // モード(OSC/FFT)切り替えスイッチ(回路図参照)
+#define ALT_SW       1    // FFTモードでのLIN/dB表示切り替え
+#define OLED_CLK     10   // SSD1306
+#define OLED_MOSI    6
+#define OLED_RESET   5
+#define OLED_DC      4
+#define OLED_CS      3
 
-// Built-in RGB LED
+
+// Built-in RGB LED (debug用なので消しても動作には問題なし、Tenstar ROBOT製のESP32S3ボードに搭載されているRGB LEDが前提)
 #include <FastLED.h>
 #define NUM_LEDS 1
-#define DATA_PIN 48
+#define LED_DATA_PIN 48
 CRGB leds[NUM_LEDS];
+
 
 // SSD1306 OLED Display (SPI)
 #include <SPI.h>
@@ -20,55 +28,72 @@ CRGB leds[NUM_LEDS];
 #include <Adafruit_SSD1306.h>
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_CLK   10
-#define OLED_MOSI   6
-#define OLED_RESET  5
-#define OLED_DC     4
-#define OLED_CS     3
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
 inline void setContrast(uint8_t contrast) {
   display.ssd1306_command(SSD1306_SETCONTRAST);
   display.ssd1306_command(contrast);
 }
 
-// ADC Definitions
+// For Drawing
+#define TOP_MARGIN    8
+#define BOTTOM_MARGIN 8
+#define DRAW_Y_MIN  (TOP_MARGIN + 1)                    // 9
+#define DRAW_Y_MAX  (SCREEN_HEIGHT - BOTTOM_MARGIN - 1) // 55
+#define DRAW_HEIGHT (DRAW_Y_MAX - DRAW_Y_MIN + 1)
+
+
+// POT Read (Using MCP3425)
+#include <Wire.h>
+void MCP3425_init() {
+  Wire.begin(MCP3425_SDA, MCP3425_SCL);
+  Wire.beginTransmission(MCP3425_ADDR);
+  Wire.write(0b10010000);
+  //           ||||||||
+  //           ||||||++---- 00 : PGA x1
+  //           ||||++------ 00 : 12bit, 240SPS
+  //           |||+--------  1 : Continuous Conversion Mode
+  //           |++--------- 00 : Channel 0 (No effect for MCP3425)
+  //           +-----------  1 : Ready Bit (No effect for MCP3425 on Continuous Mode)
+  Wire.endTransmission();
+}
+uint32_t read_pot() {
+  Wire.requestFrom(MCP3425_ADDR, 3);
+  if (Wire.available() < 2) return 0;
+  uint8_t msb = Wire.read();
+  uint8_t lsb = Wire.read();
+  while (Wire.available() != 0) {
+    Wire.read(); //configデータ捨て
+  }
+
+  // 上位12bitが有効データ
+  int32_t raw = ((msb << 8) | lsb);
+
+  // 12bit符号つき整数を32bit符号つき整数に変換
+  if (raw & 0x8000) raw |= 0xFFFFF000;
+
+  return (uint32_t)raw;
+}
+
+
+// ESP32S3 ADC Definitions
 extern "C" {
 #include "soc/adc_channel.h"
 #include "hal/adc_types.h"
 #include "esp_adc/adc_continuous.h"
-}         
-adc_unit_t    ADC_C_UNIT; // GPIO1~10: ADC1, GPIO11~20: ADC2 (ESP32-S3)
-adc_channel_t ADC_C_CH;   // To be assigned in setup()
+}
 #define ADC_ATTEN       ADC_ATTEN_DB_12
 #define ADC_BITWIDTH    ADC_BITWIDTH_12
 #define SAMPLE_RATE     64000                 // サンプリング周波数
 #define READ_LEN        (SCREEN_WIDTH * 32)   // SCREEN_WIDTH(128)の2のべき乗倍
+#define ADC_MAX         3745                  // ADC結果(0~4095)のうちの表示範囲の上限
+#define ADC_MIN         200                   //             同                下限
 
-// ArduinoFFT
-#include <arduinoFFT.h>
-constexpr uint32_t Fs = SAMPLE_RATE;
-constexpr uint32_t FFT_SIZE = READ_LEN;
-float vReal[FFT_SIZE];
-float vImag[FFT_SIZE];
-ArduinoFFT<float> fft = ArduinoFFT<float>(vReal, vImag, FFT_SIZE, Fs);
-
-// For Drawing
-#define TOP_MARGIN    8
-#define BOTTOM_MARGIN 8
-constexpr uint16_t DRAW_Y_MIN  = TOP_MARGIN + 1;                    // 9
-constexpr uint16_t DRAW_Y_MAX  = SCREEN_HEIGHT - BOTTOM_MARGIN - 1; // 55
-constexpr uint16_t DRAW_HEIGHT = DRAW_Y_MAX - DRAW_Y_MIN + 1;
-
-// State
-enum Mode {
-  MODE_OSC,
-  MODE_FFT
-};
-Mode mode = MODE_OSC;
-
-// ADC Range
-#define ADC_MAX  3745
-#define ADC_MIN   200
+// 下2つはsetup()内でSIG_PINのピン番号によって自動的に割り振られます。
+// なお、Continuousモードで使用する場合はADCユニット1のほうがよいらしいです。
+// また、ADCユニットごとにチャンネルは10割り振られていますが、モード(Continuous/Oneshot)は一つしか選択できません。
+// MCP3425の代わりに、余ったADCユニット2をOneshotモードで用いて可変抵抗の値を見ることも可能です。
+adc_unit_t    ADC_C_UNIT; // GPIO1~10: ADC1, GPIO11~20: ADC2 (ESP32-S3)
+adc_channel_t ADC_C_CH;
 
 // ADC Continuous Handler
 adc_continuous_handle_t adc_c_handle = nullptr;
@@ -123,6 +148,15 @@ void adc_task(void *pvParameters) {
   }
 }
 
+
+// ArduinoFFT
+#include <arduinoFFT.h>
+constexpr uint32_t Fs = SAMPLE_RATE;
+constexpr uint32_t FFT_SIZE = READ_LEN;
+float vReal[FFT_SIZE];
+float vImag[FFT_SIZE];
+ArduinoFFT<float> fft = ArduinoFFT<float>(vReal, vImag, FFT_SIZE, Fs);
+
 // For FFT Visualization (Log Scale Band Map)
 // Definitions
 constexpr int BAR_STEP = 2; // 2ピクセルごとにバーを描画
@@ -137,7 +171,7 @@ typedef struct {
   uint16_t i1;
 } BandMap;
 BandMap bandMap[NUM_BARS];
-// Pseudo Log Calculation
+// Pseudo Log Calculation (数学的に正しいとは言いませんがdBっぽくはなる)
 static inline uint32_t fast_log2_q4(uint32_t val) {
   if (val == 0) return 0;
   int e = 31 - __builtin_clz(val);
@@ -161,37 +195,13 @@ void generateBandMap() {
   }
 }
 
-// POT Read (MCP3425 Functions)
-#include <Wire.h>
-void MCP3425_init() {
-  Wire.begin(MCP3425_SDA, MCP3425_SCL);
-  Wire.beginTransmission(MCP3425_ADDR);
-  Wire.write(0b10010000);
-  //           ||||||||
-  //           ||||||++---- 00 : PGA x1
-  //           ||||++------ 00 : 12bit, 240SPS
-  //           |||+--------  1 : Continuous Conversion Mode
-  //           |++--------- 00 : Channel 0 (No effect for MCP3425)
-  //           +-----------  1 : Ready Bit (No effect for MCP3425 on Continuous Mode)
-  Wire.endTransmission();
-}
-uint32_t read_pot() {
-  Wire.requestFrom(MCP3425_ADDR, 3);
-  if (Wire.available() < 2) return 0;
-  uint8_t msb = Wire.read();
-  uint8_t lsb = Wire.read();
-  while (Wire.available() != 0) {
-    Wire.read(); //configデータ捨て
-  }
 
-  // 上位12bitが有効データ
-  int32_t raw = ((msb << 8) | lsb);
-
-  // 12bit符号つき整数を32bit符号つき整数に変換
-  if (raw & 0x8000) raw |= 0xFFFFF000;
-
-  return (uint32_t)raw;
-}
+// State
+enum Mode {
+  MODE_OSC,
+  MODE_FFT
+};
+Mode mode = MODE_OSC;
 
 
 void setup() {
@@ -204,7 +214,7 @@ void setup() {
   pinMode(ALT_SW, INPUT_PULLUP);
 
   // LED Setup
-  FastLED.addLeds<NEOPIXEL, DATA_PIN>(leds, NUM_LEDS);
+  FastLED.addLeds<NEOPIXEL, LED_DATA_PIN>(leds, NUM_LEDS);
   FastLED.setBrightness(255);
   FastLED.setMaxPowerInVoltsAndMilliamps(5, 100);
   leds[0] = CRGB::Yellow; FastLED.show();
